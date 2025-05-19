@@ -207,7 +207,7 @@ def format_results(results: Dict[str, Any]) -> str:
             max_diff = results["max_diffs"][pair_key]["diff"]
             avg_diff = results["avg_diffs"][pair_key]
 
-            output.append(f"\n{field1} 到 {field2}，最大时差：{max_diff:.2f}秒，平均时差：{avg_diff:.2f}秒")
+            output.append(f"{field1} 到 {field2}，最大时差：{max_diff:.2f}秒，平均时差：{avg_diff:.2f}秒")
 
     # 输出总时差
     total_pair_key = f"{TIME_FIELDS[0]}_{TIME_FIELDS[-1]}"
@@ -303,7 +303,7 @@ async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional
                 max_diff = results["max_diffs"][pair_key]["diff"]
                 avg_diff = results["avg_diffs"][pair_key]
 
-                output.append(f"\n{field1} to {field2}, Max diff: {max_diff:.2f} seconds, Avg diff: {avg_diff:.2f} seconds")
+                output.append(f"{field1} to {field2}, Max diff: {max_diff:.2f} seconds, Avg diff: {avg_diff:.2f} seconds")
 
         # 输出总时差
         total_pair_key = f"{TIME_FIELDS[0]}_{TIME_FIELDS[-1]}"
