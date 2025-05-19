@@ -56,7 +56,7 @@ TIME_FIELDS = ["mysqlInsertTime", "consumeTime", "receiveTime", "createTime", "@
 class IndexRequest(BaseModel):
     """索引请求模型"""
     index_name: Optional[str] = None
-    size: Optional[int] = 1000
+    size: Optional[int] = 1000000
 
 def get_es_client():
     """获取ES客户端连接"""
@@ -72,7 +72,7 @@ def get_total_document_count(es: Elasticsearch, index: str) -> int:
         return 0
 
 def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) -> Dict[str, Any]:
-    """计算时间字段之间的时差"""
+    """计算时间字段之间的时差，使用分页查询获取所有文档"""
     # 东八区时区
     china_tz = timezone(timedelta(hours=8))
     utc_tz = timezone.utc
@@ -80,21 +80,13 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     # 构建查询，确保所有时间字段都存在
     must_clauses = [{"exists": {"field": field}} for field in TIME_FIELDS]
 
-    # 执行查询
-    response = es.search(
-        index=index,
-        size=size,
-        _source=TIME_FIELDS,
-        query={
-            "bool": {
-                "must": must_clauses
-            }
-        }
-    )
+    # 获取文档总数
+    total_docs = get_total_document_count(es, index)
 
     # 初始化结果
     max_diffs = {}
     total_diffs = {}
+    processed_docs = 0
 
     # 初始化时差数据结构
     for i in range(len(TIME_FIELDS) - 1):
@@ -109,71 +101,107 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     max_diffs[total_pair_key] = {"diff": 0, "doc_id": None}
     total_diffs[total_pair_key] = []
 
-    # 处理每个文档
-    for hit in response['hits']['hits']:
-        doc = hit['_source']
-        doc_id = hit['_id']
+    # 设置每页大小，默认为1000
+    page_size = min(size, 1000)  # 确保每页不超过1000条
 
-        # 解析所有时间字段
-        times = {}
-        valid_doc = True
+    # 分页查询
+    from_index = 0
 
-        for field in TIME_FIELDS:
-            if field not in doc:
-                valid_doc = False
-                break
+    while from_index < total_docs:
+        # 执行查询
+        print(f"查询文档 {from_index} 到 {from_index + page_size}，总数 {total_docs}")
+        response = es.search(
+            index=index,
+            size=page_size,
+            from_=from_index,
+            _source=TIME_FIELDS,
+            query={
+                "bool": {
+                    "must": must_clauses
+                }
+            }
+        )
 
-            try:
-                if field == '@timestamp':
-                    # 处理ISO格式的UTC时间
-                    dt_str = doc[field]
-                    if 'Z' in dt_str:
-                        dt_str = dt_str.replace('Z', '+00:00')
-                    dt = datetime.fromisoformat(dt_str)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=utc_tz)
-                else:
-                    # 处理标准格式的东八区时间
-                    dt = datetime.strptime(doc[field], '%Y-%m-%d %H:%M:%S')
-                    dt = dt.replace(tzinfo=china_tz)
+        # 如果没有结果，退出循环
+        hits = response['hits']['hits']
+        if not hits:
+            break
 
-                times[field] = dt
-            except Exception as e:
-                print(f"解析时间字段 {field} 出错: {doc[field]}, 错误: {e}")
-                valid_doc = False
-                break
+        # 处理每个文档
+        for hit in hits:
+            doc = hit['_source']
+            doc_id = hit['_id']
 
-        if not valid_doc:
-            continue
+            # 解析所有时间字段
+            times = {}
+            valid_doc = True
 
-        # 计算相邻字段的时差
-        for i in range(len(TIME_FIELDS) - 1):
-            field1 = TIME_FIELDS[i]
-            field2 = TIME_FIELDS[i+1]
-            pair_key = f"{field1}_{field2}"
+            for field in TIME_FIELDS:
+                if field not in doc:
+                    valid_doc = False
+                    break
 
-            diff_seconds = (times[field2] - times[field1]).total_seconds()
-            total_diffs[pair_key].append(diff_seconds)
+                try:
+                    if field == '@timestamp':
+                        # 处理ISO格式的UTC时间
+                        dt_str = doc[field]
+                        if 'Z' in dt_str:
+                            dt_str = dt_str.replace('Z', '+00:00')
+                        dt = datetime.fromisoformat(dt_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=utc_tz)
+                    else:
+                        # 处理标准格式的东八区时间
+                        dt = datetime.strptime(doc[field], '%Y-%m-%d %H:%M:%S')
+                        dt = dt.replace(tzinfo=china_tz)
 
-            # 更新最大时差（使用绝对值比较，但保存原始值）
-            if abs(diff_seconds) > abs(max_diffs[pair_key]["diff"]):
-                max_diffs[pair_key] = {
-                    "diff": diff_seconds,
+                    times[field] = dt
+                except Exception as e:
+                    print(f"解析时间字段 {field} 出错: {doc[field]}, 错误: {e}")
+                    valid_doc = False
+                    break
+
+            if not valid_doc:
+                continue
+
+            # 计算相邻字段的时差
+            for i in range(len(TIME_FIELDS) - 1):
+                field1 = TIME_FIELDS[i]
+                field2 = TIME_FIELDS[i+1]
+                pair_key = f"{field1}_{field2}"
+
+                diff_seconds = (times[field2] - times[field1]).total_seconds()
+                total_diffs[pair_key].append(diff_seconds)
+
+                # 更新最大时差（使用绝对值比较，但保存原始值）
+                if abs(diff_seconds) > abs(max_diffs[pair_key]["diff"]):
+                    max_diffs[pair_key] = {
+                        "diff": diff_seconds,
+                        "doc_id": doc_id
+                    }
+
+            # 计算首尾字段的总时差
+            first_field = TIME_FIELDS[0]
+            last_field = TIME_FIELDS[-1]
+            total_diff = (times[last_field] - times[first_field]).total_seconds()
+            total_diffs[total_pair_key].append(total_diff)
+
+            # 更新总时差的最大值
+            if abs(total_diff) > abs(max_diffs[total_pair_key]["diff"]):
+                max_diffs[total_pair_key] = {
+                    "diff": total_diff,
                     "doc_id": doc_id
                 }
 
-        # 计算首尾字段的总时差
-        first_field = TIME_FIELDS[0]
-        last_field = TIME_FIELDS[-1]
-        total_diff = (times[last_field] - times[first_field]).total_seconds()
-        total_diffs[total_pair_key].append(total_diff)
+        # 更新已处理文档数
+        processed_docs += len(hits)
 
-        # 更新总时差的最大值
-        if abs(total_diff) > abs(max_diffs[total_pair_key]["diff"]):
-            max_diffs[total_pair_key] = {
-                "diff": total_diff,
-                "doc_id": doc_id
-            }
+        # 更新分页起始位置
+        from_index += page_size
+
+        # 如果已经处理的文档数达到了用户指定的大小限制，则退出循环
+        if size != 0 and processed_docs >= size:
+            break
 
     # 计算平均时差
     avg_diffs = {}
@@ -186,8 +214,8 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     return {
         "max_diffs": max_diffs,
         "avg_diffs": avg_diffs,
-        "processed_docs": len(response['hits']['hits']),
-        "total_docs": get_total_document_count(es, index)
+        "processed_docs": processed_docs,
+        "total_docs": total_docs
     }
 
 def format_results(results: Dict[str, Any]) -> str:
@@ -252,7 +280,7 @@ async def analyze_time_diffs(request: IndexRequest):
         raise HTTPException(status_code=500, detail=f"分析时出错: {str(e)}")
 
 @app.get("/text-report", response_class=PlainTextResponse)
-async def get_text_report(index_name: Optional[str] = None, size: Optional[int] = 1000):
+async def get_text_report(index_name: Optional[str] = None, size: Optional[int] = 100000):
     """获取文本格式的报告"""
     try:
         # 获取ES客户端
@@ -275,7 +303,7 @@ async def get_text_report(index_name: Optional[str] = None, size: Optional[int] 
         raise HTTPException(status_code=500, detail=f"生成报告时出错: {str(e)}")
 
 @app.get("/text-report-ascii", response_class=PlainTextResponse)
-async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional[int] = 1000):
+async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional[int] = 100000):
     """获取ASCII编码的文本格式报告（适用于PowerShell）"""
     try:
         # 获取ES客户端
