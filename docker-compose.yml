@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+    postgres:
+        image: 'registry.cn-hangzhou.aliyuncs.com/redgreat/orderes:latest'
+        container_name: orderes
+        hostname: orderes
+        restart: unless-stopped
+        volumes:
+            - ./conf/:/app/conf
+            - ./log/:/app/log
+        environment:
+            DISABLE_IPV6: 'true'
+            TZ: 'Asia/Shanghai'
+            LANG: 'zh_CN.UTF-8'
+        deploy:
+            resources:
+                limits:
+                    memory: 2G
+                reservations:
+                    memory: 128M
+        mem_swappiness: 0
+        oom_kill_disable: true
+        ulimits:
+            nofile:
+                soft: 65536
+                hard: 65536
