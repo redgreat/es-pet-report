@@ -56,7 +56,7 @@ TIME_FIELDS = ["mysqlInsertTime", "consumeTime", "receiveTime", "createTime", "@
 class IndexRequest(BaseModel):
     """索引请求模型"""
     index_name: Optional[str] = None
-    size: Optional[int] = 1000000
+    size: Optional[int] = 0  # 0表示不限制文档数量
 
 def get_es_client():
     """获取ES客户端连接"""
@@ -72,7 +72,7 @@ def get_total_document_count(es: Elasticsearch, index: str) -> int:
         return 0
 
 def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) -> Dict[str, Any]:
-    """计算时间字段之间的时差，使用分页查询获取所有文档"""
+    """计算时间字段之间的时差，使用Scroll API获取所有文档"""
     # 东八区时区
     china_tz = timezone(timedelta(hours=8))
     utc_tz = timezone.utc
@@ -101,33 +101,33 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     max_diffs[total_pair_key] = {"diff": 0, "doc_id": None}
     total_diffs[total_pair_key] = []
 
-    # 设置每页大小，默认为1000
-    page_size = min(size, 1000)  # 确保每页不超过1000条
+    # 设置每批大小，默认为1000
+    batch_size = min(size, 1000) if size > 0 else 1000  # 确保每批不超过1000条
 
-    # 分页查询
-    from_index = 0
-
-    while from_index < total_docs:
-        # 执行查询
-        print(f"查询文档 {from_index} 到 {from_index + page_size}，总数 {total_docs}")
-        response = es.search(
-            index=index,
-            size=page_size,
-            from_=from_index,
-            _source=TIME_FIELDS,
-            query={
-                "bool": {
-                    "must": must_clauses
-                }
+    # 初始化Scroll查询
+    print(f"开始Scroll查询，批次大小: {batch_size}，总文档数: {total_docs}")
+    response = es.search(
+        index=index,
+        scroll='2m',  # 设置滚动时间窗口为2分钟
+        size=batch_size,
+        _source=TIME_FIELDS,
+        query={
+            "bool": {
+                "must": must_clauses
             }
-        )
+        }
+    )
 
-        # 如果没有结果，退出循环
-        hits = response['hits']['hits']
-        if not hits:
-            break
+    # 获取第一批结果和scroll_id
+    scroll_id = response['_scroll_id']
+    hits = response['hits']['hits']
+    scroll_size = len(hits)
 
-        # 处理每个文档
+    # 处理所有批次的文档
+    while scroll_size > 0:
+        print(f"处理批次，文档数: {scroll_size}，已处理: {processed_docs}，总数: {total_docs}")
+
+        # 处理当前批次的每个文档
         for hit in hits:
             doc = hit['_source']
             doc_id = hit['_id']
@@ -194,14 +194,24 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
                 }
 
         # 更新已处理文档数
-        processed_docs += len(hits)
-
-        # 更新分页起始位置
-        from_index += page_size
+        processed_docs += scroll_size
 
         # 如果已经处理的文档数达到了用户指定的大小限制，则退出循环
-        if size != 0 and processed_docs >= size:
+        if size > 0 and processed_docs >= size:
             break
+
+        # 获取下一批结果
+        response = es.scroll(scroll_id=scroll_id, scroll='2m')
+        scroll_id = response['_scroll_id']
+        hits = response['hits']['hits']
+        scroll_size = len(hits)
+
+    # 清理scroll
+    try:
+        es.clear_scroll(scroll_id=scroll_id)
+        print("Scroll查询已清理")
+    except Exception as e:
+        print(f"清理Scroll查询时出错: {e}")
 
     # 计算平均时差
     avg_diffs = {}
@@ -280,8 +290,8 @@ async def analyze_time_diffs(request: IndexRequest):
         raise HTTPException(status_code=500, detail=f"分析时出错: {str(e)}")
 
 @app.get("/text-report", response_class=PlainTextResponse)
-async def get_text_report(index_name: Optional[str] = None, size: Optional[int] = 100000):
-    """获取文本格式的报告"""
+async def get_text_report(index_name: Optional[str] = None, size: Optional[int] = 0):
+    """获取文本格式的报告，size=0表示不限制文档数量"""
     try:
         # 获取ES客户端
         es = get_es_client()
@@ -303,8 +313,8 @@ async def get_text_report(index_name: Optional[str] = None, size: Optional[int] 
         raise HTTPException(status_code=500, detail=f"生成报告时出错: {str(e)}")
 
 @app.get("/text-report-ascii", response_class=PlainTextResponse)
-async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional[int] = 100000):
-    """获取ASCII编码的文本格式报告（适用于PowerShell）"""
+async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional[int] = 0):
+    """获取ASCII编码的文本格式报告（适用于PowerShell），size=0表示不限制文档数量"""
     try:
         # 获取ES客户端
         es = get_es_client()
