@@ -77,6 +77,10 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     china_tz = timezone(timedelta(hours=8))
     utc_tz = timezone.utc
 
+    # 记录统计开始时间
+    query_start_time = datetime.now(china_tz)
+    stats_start_time = datetime.now()
+
     # 构建查询，确保所有时间字段都存在
     must_clauses = [{"exists": {"field": field}} for field in TIME_FIELDS]
 
@@ -87,6 +91,7 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     max_diffs = {}
     total_diffs = {}
     processed_docs = 0
+    earliest_test_time = None  # 用于记录最早的mysqlInsertTime
 
     # 初始化时差数据结构
     for i in range(len(TIME_FIELDS) - 1):
@@ -101,21 +106,27 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     max_diffs[total_pair_key] = {"diff": 0, "doc_id": None}
     total_diffs[total_pair_key] = []
 
-    # 设置每批大小，默认为1000
-    batch_size = min(size, 1000) if size > 0 else 1000  # 确保每批不超过1000条
+    # 设置每批大小，默认为5000
+    batch_size = min(size, 5000) if size > 0 else 5000
 
     # 初始化Scroll查询
     print(f"开始Scroll查询，批次大小: {batch_size}，总文档数: {total_docs}")
+
+    # 记录查询开始时间，用于性能监控
+    batch_start_time = datetime.now()
+
     response = es.search(
         index=index,
-        scroll='2m',  # 设置滚动时间窗口为2分钟
+        scroll='5m',  # 设置滚动时间窗口为5分钟，减少超时风险
         size=batch_size,
-        _source=TIME_FIELDS,
+        _source=TIME_FIELDS,  # 只获取需要的字段
         query={
             "bool": {
                 "must": must_clauses
             }
-        }
+        },
+        sort=["_doc"],  # 按文档ID排序，这通常是最快的排序方式
+        request_timeout=60  # 设置请求超时时间
     )
 
     # 获取第一批结果和scroll_id
@@ -124,8 +135,13 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     scroll_size = len(hits)
 
     # 处理所有批次的文档
+    batch_count = 1
     while scroll_size > 0:
-        print(f"处理批次，文档数: {scroll_size}，已处理: {processed_docs}，总数: {total_docs}")
+        # 计算并显示查询耗时
+        batch_time = (datetime.now() - batch_start_time).total_seconds()
+        print(f"批次 {batch_count}: 查询耗时 {batch_time:.2f}秒，文档数: {scroll_size}，已处理: {processed_docs}，总数: {total_docs}")
+        batch_start_time = datetime.now()
+        batch_count += 1
 
         # 处理当前批次的每个文档
         for hit in hits:
@@ -156,6 +172,11 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
                         dt = dt.replace(tzinfo=china_tz)
 
                     times[field] = dt
+
+                    # 更新最早的mysqlInsertTime
+                    if field == "mysqlInsertTime":
+                        if earliest_test_time is None or dt < earliest_test_time:
+                            earliest_test_time = dt
                 except Exception as e:
                     print(f"解析时间字段 {field} 出错: {doc[field]}, 错误: {e}")
                     valid_doc = False
@@ -200,8 +221,15 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
         if size > 0 and processed_docs >= size:
             break
 
+        # 记录处理耗时
+        process_time = (datetime.now() - batch_start_time).total_seconds()
+        print(f"批次 {batch_count-1}: 处理耗时 {process_time:.2f}秒")
+
+        # 记录下一批查询开始时间
+        batch_start_time = datetime.now()
+
         # 获取下一批结果
-        response = es.scroll(scroll_id=scroll_id, scroll='2m')
+        response = es.scroll(scroll_id=scroll_id, scroll='5m', request_timeout=60)
         scroll_id = response['_scroll_id']
         hits = response['hits']['hits']
         scroll_size = len(hits)
@@ -221,16 +249,32 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
         else:
             avg_diffs[pair_key] = 0
 
+    # 计算统计耗时
+    stats_end_time = datetime.now()
+    stats_duration = (stats_end_time - stats_start_time).total_seconds()
+
+    # 格式化时间为字符串
+    query_start_time_str = query_start_time.strftime('%Y-%m-%d %H:%M:%S')
+    earliest_test_time_str = earliest_test_time.strftime('%Y-%m-%d %H:%M:%S') if earliest_test_time else "未找到"
+
     return {
         "max_diffs": max_diffs,
         "avg_diffs": avg_diffs,
         "processed_docs": processed_docs,
-        "total_docs": total_docs
+        "total_docs": total_docs,
+        "query_start_time": query_start_time_str,
+        "earliest_test_time": earliest_test_time_str,
+        "stats_duration": stats_duration  # 统计耗时（秒）
     }
 
 def format_results(results: Dict[str, Any]) -> str:
     """格式化结果为可读文本"""
     output = []
+    # 添加压测开始时间和统计完成时间
+    output.append(f"本次压测开始时间: {results.get('earliest_test_time', '未找到')}")
+    output.append(f"统计完成时间: {results.get('query_start_time', '未记录')}")
+    output.append(f"统计耗时: {results.get('stats_duration', 0):.2f}秒")
+    output.append("")
     output.append(f"总文档数量: {results['total_docs']}")
     output.append(f"处理文档数量: {results['processed_docs']}")
     output.append("\n相邻时间字段之间的时差:")
@@ -327,6 +371,11 @@ async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional
 
         # 格式化结果，但使用英文替代中文
         output = []
+        # 添加压测开始时间和统计完成时间
+        output.append(f"Test start time: {results.get('earliest_test_time', 'Not found')}")
+        output.append(f"Statistics completion time: {results.get('query_start_time', 'Not recorded')}")
+        output.append(f"Statistics duration: {results.get('stats_duration', 0):.2f} seconds")
+        output.append("")
         output.append(f"Total documents: {results['total_docs']}")
         output.append(f"Processed documents: {results['processed_docs']}")
         output.append("\nTime differences between adjacent time fields:")
