@@ -90,6 +90,7 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     # 初始化结果
     max_diffs = {}
     total_diffs = {}
+    diff_distributions = {}  # 用于记录时间差分布
     processed_docs = 0
     earliest_test_time = None  # 用于记录最早的mysqlInsertTime
 
@@ -100,11 +101,27 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
         pair_key = f"{field1}_{field2}"
         max_diffs[pair_key] = {"diff": 0, "doc_id": None}
         total_diffs[pair_key] = []
+        # 初始化时间差分布统计
+        diff_distributions[pair_key] = {
+            "under_0.5s": 0,  # 0.5秒以下
+            "0.5s_to_1s": 0,  # 0.5-1秒
+            "1s_to_2s": 0,    # 1-2秒
+            "2s_to_5s": 0,    # 2-5秒
+            "over_5s": 0      # 5秒以上
+        }
 
     # 添加首尾字段的总时差
     total_pair_key = f"{TIME_FIELDS[0]}_{TIME_FIELDS[-1]}"
     max_diffs[total_pair_key] = {"diff": 0, "doc_id": None}
     total_diffs[total_pair_key] = []
+    # 初始化总时间差分布统计
+    diff_distributions[total_pair_key] = {
+        "under_0.5s": 0,
+        "0.5s_to_1s": 0,
+        "1s_to_2s": 0,
+        "2s_to_5s": 0,
+        "over_5s": 0
+    }
 
     # 设置每批大小，默认为5000
     batch_size = min(size, 5000) if size > 0 else 5000
@@ -194,6 +211,19 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
                 diff_seconds = (times[field2] - times[field1]).total_seconds()
                 total_diffs[pair_key].append(diff_seconds)
 
+                # 更新时间差分布统计
+                abs_diff = abs(diff_seconds)
+                if abs_diff < 0.5:
+                    diff_distributions[pair_key]["under_0.5s"] += 1
+                elif abs_diff < 1.0:
+                    diff_distributions[pair_key]["0.5s_to_1s"] += 1
+                elif abs_diff < 2.0:
+                    diff_distributions[pair_key]["1s_to_2s"] += 1
+                elif abs_diff < 5.0:
+                    diff_distributions[pair_key]["2s_to_5s"] += 1
+                else:
+                    diff_distributions[pair_key]["over_5s"] += 1
+
                 # 更新最大时差（使用绝对值比较，但保存原始值）
                 if abs(diff_seconds) > abs(max_diffs[pair_key]["diff"]):
                     max_diffs[pair_key] = {
@@ -206,6 +236,19 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
             last_field = TIME_FIELDS[-1]
             total_diff = (times[last_field] - times[first_field]).total_seconds()
             total_diffs[total_pair_key].append(total_diff)
+
+            # 更新总时差分布统计
+            abs_total_diff = abs(total_diff)
+            if abs_total_diff < 0.5:
+                diff_distributions[total_pair_key]["under_0.5s"] += 1
+            elif abs_total_diff < 1.0:
+                diff_distributions[total_pair_key]["0.5s_to_1s"] += 1
+            elif abs_total_diff < 2.0:
+                diff_distributions[total_pair_key]["1s_to_2s"] += 1
+            elif abs_total_diff < 5.0:
+                diff_distributions[total_pair_key]["2s_to_5s"] += 1
+            else:
+                diff_distributions[total_pair_key]["over_5s"] += 1
 
             # 更新总时差的最大值
             if abs(total_diff) > abs(max_diffs[total_pair_key]["diff"]):
@@ -260,6 +303,7 @@ def calculate_time_differences(es: Elasticsearch, index: str, size: int = 1000) 
     return {
         "max_diffs": max_diffs,
         "avg_diffs": avg_diffs,
+        "diff_distributions": diff_distributions,  # 时间差分布统计
         "processed_docs": processed_docs,
         "total_docs": total_docs,
         "query_start_time": query_start_time_str,
@@ -289,7 +333,18 @@ def format_results(results: Dict[str, Any]) -> str:
             max_diff = results["max_diffs"][pair_key]["diff"]
             avg_diff = results["avg_diffs"][pair_key]
 
+            # 获取时间差分布
+            dist = results["diff_distributions"].get(pair_key, {})
+            under_05s = dist.get("under_0.5s", 0)
+            under_05s_percent = (under_05s / results["processed_docs"]) * 100 if results["processed_docs"] > 0 else 0
+
             output.append(f"{field1} 到 {field2}，最大时差：{max_diff:.2f}秒，平均时差：{avg_diff:.2f}秒")
+            output.append(f"  时间差分布：")
+            output.append(f"    0.5秒以下: {under_05s}个文档 ({under_05s_percent:.2f}%)")
+            output.append(f"    0.5-1秒: {dist.get('0.5s_to_1s', 0)}个文档")
+            output.append(f"    1-2秒: {dist.get('1s_to_2s', 0)}个文档")
+            output.append(f"    2-5秒: {dist.get('2s_to_5s', 0)}个文档")
+            output.append(f"    5秒以上: {dist.get('over_5s', 0)}个文档")
 
     # 输出总时差
     total_pair_key = f"{TIME_FIELDS[0]}_{TIME_FIELDS[-1]}"
@@ -297,7 +352,18 @@ def format_results(results: Dict[str, Any]) -> str:
         max_diff = results["max_diffs"][total_pair_key]["diff"]
         avg_diff = results["avg_diffs"][total_pair_key]
 
+        # 获取总时差分布
+        dist = results["diff_distributions"].get(total_pair_key, {})
+        under_05s = dist.get("under_0.5s", 0)
+        under_05s_percent = (under_05s / results["processed_docs"]) * 100 if results["processed_docs"] > 0 else 0
+
         output.append(f"\n{TIME_FIELDS[0]} 到 {TIME_FIELDS[-1]} 总最大时差：{max_diff:.2f}秒，总平均时差：{avg_diff:.2f}秒")
+        output.append(f"  总时差分布：")
+        output.append(f"    0.5秒以下: {under_05s}个文档 ({under_05s_percent:.2f}%)")
+        output.append(f"    0.5-1秒: {dist.get('0.5s_to_1s', 0)}个文档")
+        output.append(f"    1-2秒: {dist.get('1s_to_2s', 0)}个文档")
+        output.append(f"    2-5秒: {dist.get('2s_to_5s', 0)}个文档")
+        output.append(f"    5秒以上: {dist.get('over_5s', 0)}个文档")
 
     return "\n".join(output)
 
@@ -390,7 +456,18 @@ async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional
                 max_diff = results["max_diffs"][pair_key]["diff"]
                 avg_diff = results["avg_diffs"][pair_key]
 
+                # 获取时间差分布
+                dist = results["diff_distributions"].get(pair_key, {})
+                under_05s = dist.get("under_0.5s", 0)
+                under_05s_percent = (under_05s / results["processed_docs"]) * 100 if results["processed_docs"] > 0 else 0
+
                 output.append(f"{field1} to {field2}, Max diff: {max_diff:.2f} seconds, Avg diff: {avg_diff:.2f} seconds")
+                output.append(f"  Time diff distribution:")
+                output.append(f"    Under 0.5s: {under_05s} docs ({under_05s_percent:.2f}%)")
+                output.append(f"    0.5s-1s: {dist.get('0.5s_to_1s', 0)} docs")
+                output.append(f"    1s-2s: {dist.get('1s_to_2s', 0)} docs")
+                output.append(f"    2s-5s: {dist.get('2s_to_5s', 0)} docs")
+                output.append(f"    Over 5s: {dist.get('over_5s', 0)} docs")
 
         # 输出总时差
         total_pair_key = f"{TIME_FIELDS[0]}_{TIME_FIELDS[-1]}"
@@ -398,7 +475,18 @@ async def get_text_report_ascii(index_name: Optional[str] = None, size: Optional
             max_diff = results["max_diffs"][total_pair_key]["diff"]
             avg_diff = results["avg_diffs"][total_pair_key]
 
+            # 获取总时差分布
+            dist = results["diff_distributions"].get(total_pair_key, {})
+            under_05s = dist.get("under_0.5s", 0)
+            under_05s_percent = (under_05s / results["processed_docs"]) * 100 if results["processed_docs"] > 0 else 0
+
             output.append(f"\n{TIME_FIELDS[0]} to {TIME_FIELDS[-1]} Total max diff: {max_diff:.2f} seconds, Total avg diff: {avg_diff:.2f} seconds")
+            output.append(f"  Total time diff distribution:")
+            output.append(f"    Under 0.5s: {under_05s} docs ({under_05s_percent:.2f}%)")
+            output.append(f"    0.5s-1s: {dist.get('0.5s_to_1s', 0)} docs")
+            output.append(f"    1s-2s: {dist.get('1s_to_2s', 0)} docs")
+            output.append(f"    2s-5s: {dist.get('2s_to_5s', 0)} docs")
+            output.append(f"    Over 5s: {dist.get('over_5s', 0)} docs")
 
         # 创建响应并设置ASCII编码
         text_result = "\n".join(output)
